@@ -1,0 +1,182 @@
+package rabbitmq
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/docker/go-connections/nat"
+	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"sample/contracts"
+)
+
+// https://github.com/testcontainers/testcontainers-go/issues/1359
+// https://github.com/testcontainers/testcontainers-go/issues/1249
+
+type rabbitmqTestContainers struct {
+	container      testcontainers.Container
+	defaultOptions *contracts.RabbitMQContainerOptions
+}
+
+func NewRabbitMQTestContainers() contracts.RabbitMQContainer {
+	return &rabbitmqTestContainers{
+		defaultOptions: &contracts.RabbitMQContainerOptions{
+			Ports:       []string{"5672/tcp", "15672/tcp", "15671/tcp", "25672/tcp", "5671/tcp"},
+			Host:        "localhost",
+			VirtualHost: "/",
+			UserName:    "guest",
+			Password:    "guest",
+			HttpPort:    15672,
+			HostPort:    5672,
+			Tag:         "management",
+			ImageName:   "rabbitmq",
+			Name:        "rabbitmq-testcontainers",
+		},
+	}
+}
+
+func (g *rabbitmqTestContainers) CreatingContainerOptions(
+	ctx context.Context,
+	t *testing.T,
+	options ...*contracts.RabbitMQContainerOptions,
+) (*RabbitmqOptions, error) {
+	// https://github.com/testcontainers/testcontainers-go
+	// https://dev.to/remast/go-integration-tests-using-testcontainers-9o5
+	containerReq := g.getRunOptions(options...)
+
+	// TODO: Using Parallel Container
+	dbContainer, err := testcontainers.GenericContainer(
+		ctx,
+		testcontainers.GenericContainerRequest{
+			ContainerRequest: containerReq,
+			Started:          true,
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	// get a free random host port for rabbitmq `Tcp Port`
+	hostPort, err := dbContainer.MappedPort(ctx, nat.Port(g.defaultOptions.Ports[0]))
+	if err != nil {
+		return nil, err
+	}
+	g.defaultOptions.HostPort = hostPort.Int()
+	t.Logf("rabbitmq host port is: %d", hostPort.Int())
+
+	// https://github.com/michaelklishin/rabbit-hole/issues/74
+	// get a free random host port for rabbitmq UI `Http Port`
+	uiHttpPort, err := dbContainer.MappedPort(ctx, nat.Port(g.defaultOptions.Ports[1]))
+	if err != nil {
+		return nil, err
+	}
+	g.defaultOptions.HttpPort = uiHttpPort.Int()
+	t.Logf("rabbitmq ui port is: %d", uiHttpPort.Int())
+
+	host, err := dbContainer.Host(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	rawConnect(host, hostPort.Int())
+
+	g.container = dbContainer
+
+	// Clean up the container after the test is complete
+	t.Cleanup(func() {
+		if err := dbContainer.Terminate(ctx); err != nil {
+			t.Fatalf("failed to terminate container: %s", err)
+		}
+	})
+
+	option := &RabbitmqOptions{
+		RabbitmqHostOptions: &RabbitmqHostOptions{
+			UserName:    g.defaultOptions.UserName,
+			Password:    g.defaultOptions.Password,
+			HostName:    host,
+			VirtualHost: g.defaultOptions.VirtualHost,
+			Port:        g.defaultOptions.HostPort,
+			HttpPort:    g.defaultOptions.HttpPort,
+		},
+	}
+
+	return option, nil
+}
+
+func rawConnect(host string, port int) {
+	timeout := time.Second
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
+	if err != nil {
+		fmt.Println("RabbitMQ connecting error:", err)
+	}
+	if conn != nil {
+		defer conn.Close()
+		fmt.Println("Opened rabbitmq connection.", net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+}
+
+func (g *rabbitmqTestContainers) Start(
+	ctx context.Context,
+	t *testing.T,
+) (*amqp.Channel, error) {
+
+	rabbitmqOptions, err := g.CreatingContainerOptions(ctx, t)
+	require.NoError(t, err)
+
+	conn, err := amqp.Dial(rabbitmqOptions.RabbitmqHostOptions.AmqpEndPoint())
+	require.NoError(t, err, "Failed to connect to RabbitMQ")
+
+	ch, err := conn.Channel()
+	require.NoError(t, err, "Failed to open a channel")
+
+	return ch, err
+}
+
+func (g *rabbitmqTestContainers) Cleanup(ctx context.Context) error {
+	return g.container.Terminate(ctx)
+}
+
+func (g *rabbitmqTestContainers) getRunOptions(
+	opts ...*contracts.RabbitMQContainerOptions,
+) testcontainers.ContainerRequest {
+	if len(opts) > 0 && opts[0] != nil {
+		option := opts[0]
+		if option.ImageName != "" {
+			g.defaultOptions.ImageName = option.ImageName
+		}
+		if option.Host != "" {
+			g.defaultOptions.Host = option.Host
+		}
+		if len(option.Ports) > 0 {
+			g.defaultOptions.Ports = option.Ports
+		}
+		if option.UserName != "" {
+			g.defaultOptions.UserName = option.UserName
+		}
+		if option.Password != "" {
+			g.defaultOptions.Password = option.Password
+		}
+		if option.Tag != "" {
+			g.defaultOptions.Tag = option.Tag
+		}
+	}
+
+	containerReq := testcontainers.ContainerRequest{
+		Image:        fmt.Sprintf("%s:%s", g.defaultOptions.ImageName, g.defaultOptions.Tag),
+		ExposedPorts: g.defaultOptions.Ports,
+		WaitingFor:   wait.ForListeningPort(nat.Port(g.defaultOptions.Ports[0])).WithPollInterval(2 * time.Second),
+		Hostname:     g.defaultOptions.Host,
+		Env: map[string]string{
+			"RABBITMQ_DEFAULT_USER": g.defaultOptions.UserName,
+			"RABBITMQ_DEFAULT_PASS": g.defaultOptions.Password,
+		},
+	}
+
+	return containerReq
+}
