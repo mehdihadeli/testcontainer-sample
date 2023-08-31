@@ -35,10 +35,5 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
-        # https://pkg.go.dev/cmd/go#hdr-Compile_packages_and_dependencies
-        # https://pkg.go.dev/cmd/go#hdr-Package_lists_and_patterns
-      - name: Build
-        run: make build
-
       - name: Tests
         run: go test -count=1 -p=1 -parallel=1 ./...
